@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 
 	"github.com/segmentio/kafka-go"
 )
@@ -44,15 +46,15 @@ func (b BucketBalancer) Balance(msg kafka.Message, partitions ...int) int {
 	if len(partitions) == 0 {
 		return 0
 	}
-	
+
 	pivot := int(float64(len(partitions)) * b.SplitAt)
-	
+
 	var key Key
 	if err := json.Unmarshal(msg.Key, &key); err != nil {
 		// Fall back to bottom partitions on unmarshal error
 		return b.WithinBucketBalancer.Balance(msg, partitions[:pivot]...)
 	}
-	
+
 	// Select bucket based on urgency
 	var candidates []int
 	if key.Urgent {
@@ -60,22 +62,25 @@ func (b BucketBalancer) Balance(msg kafka.Message, partitions ...int) int {
 	} else {
 		candidates = partitions[:pivot] // bottom partitions (regular)
 	}
-	
+
 	partition := b.WithinBucketBalancer.Balance(msg, candidates...)
-	
+
 	fmt.Printf("Assigning %s message to partition %v (candidates: %v)\n",
 		map[bool]string{true: "⏫ priority", false: "⏺️ regular "}[key.Urgent],
 		partition, candidates,
 	)
-	
+
 	return partition
 }
 
 func main() {
+	logger := log.New(os.Stdout, "kafka: ", log.LstdFlags)
+
 	naiveWriter := &kafka.Writer{
 		Addr:     kafka.TCP(BROKER),
 		Topic:    TOPIC,
 		Balancer: kafka.CRC32Balancer{},
+		Logger:   logger,
 	}
 	defer naiveWriter.Close()
 
@@ -83,24 +88,25 @@ func main() {
 		Addr:     kafka.TCP(BROKER),
 		Topic:    TOPIC,
 		Balancer: BucketBalancer{SplitAt: 0.8},
+		Logger:   logger,
 	}
 	defer priorityWriter.Close()
 
 	messages := []kafka.Message{
-		makeMessage(Key{User: "user-123", Urgent: false}, Value{Message: "hello"}),
-		makeMessage(Key{User: "user-123", Urgent: true}, Value{Message: "hello"}),
-		makeMessage(Key{User: "user-456", Urgent: false}, Value{Message: "hello"}),
-		makeMessage(Key{User: "user-456", Urgent: true}, Value{Message: "hello"}),
+		makeMessage(Key{User: "user-001", Urgent: false}, Value{Message: "hello"}),
+		makeMessage(Key{User: "user-002", Urgent: true}, Value{Message: "hello"}),
+		makeMessage(Key{User: "user-003", Urgent: false}, Value{Message: "hello"}),
+		makeMessage(Key{User: "user-004", Urgent: true}, Value{Message: "hello"}),
 	}
 	ctx := context.Background()
 
-	// produce messages using the naive writer
+	fmt.Println("Producing messages using the naive writer")
 	err := naiveWriter.WriteMessages(ctx, messages...)
 	if err != nil {
 		panic("could not write message " + err.Error())
 	}
 
-	// produce messages using the priority writer
+	fmt.Println("Producing messages using the priority writer")
 	err = priorityWriter.WriteMessages(ctx, messages...)
 	if err != nil {
 		panic("could not write message " + err.Error())
