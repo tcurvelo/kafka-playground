@@ -40,29 +40,34 @@ type BucketBalancer struct {
 	SplitAt              float64 // e.g., 0.8 for top 20%
 }
 
-func (u BucketBalancer) Balance(msg kafka.Message, partitions ...int) int {
+func (b BucketBalancer) Balance(msg kafka.Message, partitions ...int) int {
 	if len(partitions) == 0 {
 		return 0
 	}
-	pivot := int(float64(len(partitions)) * u.SplitAt)
-
-	// if Urgent, assign to "priority" bucket (aka. top partitions)
-	// using the crc balancer within the bucket
-	decodedKey := Key{}
-	err := json.Unmarshal(msg.Key, &decodedKey)
-	if err == nil && decodedKey.Urgent {
-		topPartitions := partitions[pivot:]
-		partition := u.WithinBucketBalancer.Balance(msg, topPartitions...)
-
-		fmt.Printf("Assigning urgent message to partition %v (candidates: %v)\n", partition, topPartitions)
-		return partition
+	
+	pivot := int(float64(len(partitions)) * b.SplitAt)
+	
+	var key Key
+	if err := json.Unmarshal(msg.Key, &key); err != nil {
+		// Fall back to bottom partitions on unmarshal error
+		return b.WithinBucketBalancer.Balance(msg, partitions[:pivot]...)
 	}
-
-	// fallback, use the hash-based partitioning within bottom bucket
-	bottomPartitions := partitions[:pivot]
-	partition := u.WithinBucketBalancer.Balance(msg, bottomPartitions...)
-
-	fmt.Printf("Assigning non-urgent message to partition %v (candidates: %v)\n", partition, bottomPartitions)
+	
+	// Select bucket based on urgency
+	var candidates []int
+	if key.Urgent {
+		candidates = partitions[pivot:] // top partitions (priority)
+	} else {
+		candidates = partitions[:pivot] // bottom partitions (regular)
+	}
+	
+	partition := b.WithinBucketBalancer.Balance(msg, candidates...)
+	
+	fmt.Printf("Assigning %s message to partition %v (candidates: %v)\n",
+		map[bool]string{true: "⏫ priority", false: "⏺️ regular "}[key.Urgent],
+		partition, candidates,
+	)
+	
 	return partition
 }
 
@@ -79,15 +84,9 @@ func main() {
 		Topic:    TOPIC,
 		Balancer: BucketBalancer{SplitAt: 0.8},
 	}
+	defer priorityWriter.Close()
 
-	// defer priorityWriter.Close()
-	messages2naive := []kafka.Message{
-		makeMessage(Key{User: "user-123", Urgent: false}, Value{Message: "hello"}),
-		makeMessage(Key{User: "user-123", Urgent: true}, Value{Message: "hello"}),
-		makeMessage(Key{User: "user-456", Urgent: false}, Value{Message: "hello"}),
-		makeMessage(Key{User: "user-456", Urgent: true}, Value{Message: "hello"}),
-	}
-	messages2priority := []kafka.Message{
+	messages := []kafka.Message{
 		makeMessage(Key{User: "user-123", Urgent: false}, Value{Message: "hello"}),
 		makeMessage(Key{User: "user-123", Urgent: true}, Value{Message: "hello"}),
 		makeMessage(Key{User: "user-456", Urgent: false}, Value{Message: "hello"}),
@@ -96,13 +95,13 @@ func main() {
 	ctx := context.Background()
 
 	// produce messages using the naive writer
-	err := naiveWriter.WriteMessages(ctx, messages2naive...)
+	err := naiveWriter.WriteMessages(ctx, messages...)
 	if err != nil {
 		panic("could not write message " + err.Error())
 	}
 
 	// produce messages using the priority writer
-	err = priorityWriter.WriteMessages(ctx, messages2priority...)
+	err = priorityWriter.WriteMessages(ctx, messages...)
 	if err != nil {
 		panic("could not write message " + err.Error())
 	}
